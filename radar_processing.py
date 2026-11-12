@@ -5,7 +5,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 from sklearn.cluster import DBSCAN
-from mpl_toolkits.mplot3d import Axes3D
+from scipy.optimize import linear_sum_assignment
+from matplotlib.widgets import Button
 
 
 # ============================================================
@@ -15,45 +16,44 @@ from mpl_toolkits.mplot3d import Axes3D
 INPUT_FILE = "radar_xyz.csv"
 
 OUTPUT_DIR = "radar_output"
-
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# DBSCAN parameters
-EPS = 1.5
-MIN_SAMPLES = 4
+# DBSCAN
+EPS = 0.35
+MIN_SAMPLES = 2
+MIN_SNR = 10
 
-# Tracking parameters
-MAX_TRACK_DISTANCE = 1.5
+# Tracking
+SINGLE_TARGET_MODE = True
+MAX_TRACK_DISTANCE = 1.0
 MAX_MISSING_FRAMES = 5
 
-# Radar frame timing
-# Replace this with the actual interval between radar frames.
+# Actual time between consecutive radar frames (seconds)
 FRAME_PERIOD = 0.1
 
 # Movement classification
 VELOCITY_THRESHOLD = 0.15
-
-# Set this after verifying the RD-60 velocity sign convention.
 NEGATIVE_IS_APPROACHING = True
 
-# Region of interest (ROI), in metres
+# Region of interest (metres)
 ROI_X = (0.0, 5.0)
 ROI_Y = (-2.0, 2.0)
 ROI_Z = (-2.0, 2.0)
 
-# Minimum SNR threshold
-MIN_SNR = 10
+# Fixed plot boundaries for every frame
+# Change these limits to suit your radar's measurement area.
+X_LIMITS = (-6.0, 6.0)
+Y_LIMITS = (-6.0, 6.0)
+Z_LIMITS = (-6.0, 6.0)
 
 
 # ============================================================
-# 2. LOAD AND PREPROCESS CSV
+# 2. LOAD RADAR DATA
 # ============================================================
 
 print("\nLoading radar data...")
 
 df = pd.read_csv(INPUT_FILE, encoding="utf-8-sig")
-
-# Remove whitespace from column names
 df.columns = df.columns.str.strip()
 
 required_columns = [
@@ -64,43 +64,35 @@ for col in required_columns:
     if col not in df.columns:
         raise ValueError(f"Missing required column: {col}")
 
-# Convert required fields to numeric
 for col in required_columns:
     df[col] = pd.to_numeric(df[col], errors="coerce")
 
-df = df.dropna(subset=required_columns)
+df.dropna(subset=required_columns, inplace=True)
 
-# ============================================================
-# RD-60 COORDINATE TRANSFORMATION
-# Module rotated 90 degrees clockwise
-# ============================================================
-
-df["X_old"] = df["X"].copy()
-df["Y_old"] = df["Y"].copy()
-df["Z_old"] = df["Z"].copy()
-
-df["X"] = df["Z_old"]
-df["Y"] = df["Y_old"]
-df["Z"] = -df["X_old"]
-
-print("RD-60 coordinate transformation applied.")
-
-# Filter low-SNR points
 df = df[df["SNR"] >= MIN_SNR].copy()
-
 df["FrameIndex"] = df["FrameIndex"].astype(int)
+
+if df.empty:
+    raise ValueError("No valid radar points found.")
 
 frames = sorted(df["FrameIndex"].unique())
 
-if len(frames) == 0:
-    raise ValueError("No valid radar frames found.")
-
-print("Total frames:", len(frames))
-print("Total valid points:", len(df))
+print("Frames:", len(frames))
+print("Valid points:", len(df))
 
 
 # ============================================================
-# 3. DBSCAN CLUSTERING
+# 3. COORDINATES
+# ============================================================
+
+# Use the original XYZ coordinates without any axis correction.
+# No rotation or coordinate transformation is applied.
+
+print("Using original radar XYZ coordinates.")
+
+
+# ============================================================
+# 4. DBSCAN CLUSTERING
 # ============================================================
 
 print("\nPerforming DBSCAN clustering...")
@@ -110,14 +102,16 @@ centroid_records = []
 
 for frame in frames:
 
-    frame_data = df[df["FrameIndex"] == frame].copy()
+    frame_data = df[
+        df["FrameIndex"] == frame
+    ].copy()
 
-    if frame_data.empty:
-        continue
-
-    points = frame_data[["X", "Y", "Z"]].to_numpy()
+    points = frame_data[
+        ["X", "Y", "Z"]
+    ].to_numpy()
 
     if len(points) < MIN_SAMPLES:
+
         frame_data["ClusterID"] = -1
         clustered_frames.append(frame_data)
         continue
@@ -130,10 +124,8 @@ for frame in frames:
     labels = clustering.fit_predict(points)
 
     frame_data["ClusterID"] = labels
-
     clustered_frames.append(frame_data)
 
-    # Calculate centroid for every non-noise cluster
     for cluster_id in sorted(set(labels)):
 
         if cluster_id == -1:
@@ -144,6 +136,7 @@ for frame in frames:
         ]
 
         centroid_records.append({
+
             "FrameIndex": frame,
             "ClusterID": cluster_id,
 
@@ -175,121 +168,67 @@ centroids_df.to_csv(
     index=False
 )
 
+if centroids_df.empty:
+    raise ValueError(
+        "No clusters detected. Increase EPS or reduce MIN_SAMPLES."
+    )
+
 print("DBSCAN completed.")
 print("Total clusters:", len(centroids_df))
 
-if centroids_df.empty:
-    raise ValueError(
-        "DBSCAN did not detect any clusters. "
-        "Try reducing MIN_SAMPLES or increasing EPS."
-    )
-
 
 # ============================================================
-# 4. TARGET TRACKING
+# 5. TARGET TRACKING
 # ============================================================
 
 print("\nTracking targets...")
 
-tracks = {}
 tracking_records = []
 
-next_target_id = 1
+if SINGLE_TARGET_MODE:
 
-for frame in frames:
+    # Single physical object experiment.
+    # Maintain one persistent target ID.
 
-    detections = centroids_df[
-        centroids_df["FrameIndex"] == frame
-    ].copy()
+    TARGET_ID = 1
+    previous_position = None
 
-    if detections.empty:
-        continue
+    for frame in frames:
 
-    detection_positions = detections[
-        ["X", "Y", "Z"]
-    ].to_numpy()
+        detections = centroids_df[
+            centroids_df["FrameIndex"] == frame
+        ].copy()
 
-    # Find tracks that have not been missing too long
-    active_tracks = {}
+        if detections.empty:
+            continue
 
-    for target_id, track in tracks.items():
+        if previous_position is None:
 
-        missing_frames = frame - track["last_frame"]
+            detection = detections.iloc[0]
 
-        if missing_frames <= MAX_MISSING_FRAMES:
-            active_tracks[target_id] = track
+        else:
 
-    # Build possible track-detection matches
-    possible_matches = []
+            positions = detections[
+                ["X", "Y", "Z"]
+            ].to_numpy()
 
-    for target_id, track in active_tracks.items():
-
-        previous_position = track["position"]
-
-        for detection_index, position in enumerate(
-            detection_positions
-        ):
-
-            distance = np.linalg.norm(
-                position - previous_position
+            distances = np.linalg.norm(
+                positions - previous_position,
+                axis=1
             )
 
-            if distance <= MAX_TRACK_DISTANCE:
+            detection = detections.iloc[
+                np.argmin(distances)
+            ]
 
-                possible_matches.append((
-                    distance,
-                    target_id,
-                    detection_index
-                ))
-
-    # Greedy nearest-distance assignment
-    possible_matches.sort(key=lambda x: x[0])
-
-    matched_tracks = set()
-    matched_detections = set()
-
-    assignments = {}
-
-    for distance, target_id, detection_index in possible_matches:
-
-        if target_id in matched_tracks:
-            continue
-
-        if detection_index in matched_detections:
-            continue
-
-        assignments[detection_index] = target_id
-
-        matched_tracks.add(target_id)
-        matched_detections.add(detection_index)
-
-    # Create new target IDs for unmatched detections
-    for detection_index in range(len(detections)):
-
-        if detection_index not in assignments:
-
-            assignments[detection_index] = next_target_id
-            next_target_id += 1
-
-    # Update tracks and record target positions
-    for detection_index, target_id in assignments.items():
-
-        detection = detections.iloc[detection_index]
-
-        position = np.array([
-            detection["X"],
-            detection["Y"],
-            detection["Z"]
-        ])
-
-        tracks[target_id] = {
-            "position": position,
-            "last_frame": frame
-        }
+        position = detection[
+            ["X", "Y", "Z"]
+        ].to_numpy(dtype=float)
 
         tracking_records.append({
+
             "FrameIndex": frame,
-            "TargetID": target_id,
+            "TargetID": TARGET_ID,
 
             "X": detection["X"],
             "Y": detection["Y"],
@@ -301,20 +240,115 @@ for frame in frames:
             "PointCount": detection["PointCount"]
         })
 
+        previous_position = position
+
+else:
+
+    # Multi-object tracking using Hungarian assignment.
+
+    tracks = {}
+    next_target_id = 1
+
+    for frame in frames:
+
+        detections = centroids_df[
+            centroids_df["FrameIndex"] == frame
+        ].copy().reset_index(drop=True)
+
+        if detections.empty:
+            continue
+
+        positions = detections[
+            ["X", "Y", "Z"]
+        ].to_numpy()
+
+        active_tracks = {
+            target_id: track
+            for target_id, track in tracks.items()
+            if frame - track["last_frame"] <= MAX_MISSING_FRAMES
+        }
+
+        track_ids = list(active_tracks.keys())
+        assignments = {}
+
+        if track_ids:
+
+            previous_positions = np.array([
+                active_tracks[target_id]["position"]
+                for target_id in track_ids
+            ])
+
+            distances = np.linalg.norm(
+                previous_positions[:, None, :] -
+                positions[None, :, :],
+                axis=2
+            )
+
+            row_indices, col_indices = linear_sum_assignment(
+                distances
+            )
+
+            for row, col in zip(row_indices, col_indices):
+
+                if distances[row, col] <= MAX_TRACK_DISTANCE:
+
+                    assignments[col] = track_ids[row]
+
+        for detection_index in range(len(detections)):
+
+            if detection_index not in assignments:
+
+                assignments[detection_index] = next_target_id
+                next_target_id += 1
+
+        for detection_index, target_id in assignments.items():
+
+            detection = detections.iloc[detection_index]
+
+            position = detection[
+                ["X", "Y", "Z"]
+            ].to_numpy(dtype=float)
+
+            tracks[target_id] = {
+                "position": position,
+                "last_frame": frame
+            }
+
+            tracking_records.append({
+
+                "FrameIndex": frame,
+                "TargetID": target_id,
+
+                "X": detection["X"],
+                "Y": detection["Y"],
+                "Z": detection["Z"],
+
+                "Velocity": detection["Velocity"],
+                "SNR": detection["SNR"],
+
+                "PointCount": detection["PointCount"]
+            })
+
 
 tracking_df = pd.DataFrame(tracking_records)
 
-tracking_df.to_csv(
-    os.path.join(OUTPUT_DIR, "target_tracking.csv"),
-    index=False
+if tracking_df.empty:
+    raise ValueError("No targets could be tracked.")
+
+tracking_df.sort_values(
+    ["TargetID", "FrameIndex"],
+    inplace=True
 )
 
 print("Tracking completed.")
-print("Total target IDs:", tracking_df["TargetID"].nunique())
+print(
+    "Target IDs:",
+    sorted(tracking_df["TargetID"].unique())
+)
 
 
 # ============================================================
-# 5. MOVEMENT CLASSIFICATION
+# 6. MOVEMENT CLASSIFICATION
 # ============================================================
 
 def classify_movement(velocity):
@@ -324,31 +358,18 @@ def classify_movement(velocity):
 
     if NEGATIVE_IS_APPROACHING:
 
-        if velocity < 0:
-            return "Approaching"
+        return "Approaching" if velocity < 0 else "Moving Away"
 
-        return "Moving Away"
-
-    else:
-
-        if velocity > 0:
-            return "Approaching"
-
-        return "Moving Away"
+    return "Approaching" if velocity > 0 else "Moving Away"
 
 
 tracking_df["Movement"] = tracking_df[
     "Velocity"
 ].apply(classify_movement)
 
-tracking_df.to_csv(
-    os.path.join(OUTPUT_DIR, "target_tracking.csv"),
-    index=False
-)
-
 
 # ============================================================
-# 6. DWELL-TIME CALCULATION
+# 7. DWELL-TIME CALCULATION
 # ============================================================
 
 def inside_roi(row):
@@ -380,10 +401,8 @@ for target_id in sorted(tracking_df["TargetID"].unique()):
     if inside_frames.empty:
         continue
 
-    # Divide visits when there is a gap in ROI observations
     visits = []
     current_visit = []
-
     previous_frame = None
 
     for _, row in inside_frames.iterrows():
@@ -392,8 +411,7 @@ for target_id in sorted(tracking_df["TargetID"].unique()):
 
         if (
             previous_frame is not None
-            and current_frame - previous_frame
-            > MAX_MISSING_FRAMES
+            and current_frame - previous_frame > MAX_MISSING_FRAMES
         ):
 
             visits.append(current_visit)
@@ -405,16 +423,11 @@ for target_id in sorted(tracking_df["TargetID"].unique()):
     if current_visit:
         visits.append(current_visit)
 
-    # Calculate dwell time for each visit
     for visit_number, visit in enumerate(visits, start=1):
 
         start_frame = int(visit[0]["FrameIndex"])
         end_frame = int(visit[-1]["FrameIndex"])
 
-        observed_frames = len(visit)
-
-        # Estimate elapsed time from frame indices.
-        # This assumes observations are regularly sampled.
         dwell_time = (
             (end_frame - start_frame + 1) * FRAME_PERIOD
         )
@@ -427,7 +440,7 @@ for target_id in sorted(tracking_df["TargetID"].unique()):
             "StartFrame": start_frame,
             "EndFrame": end_frame,
 
-            "ObservedFrames": observed_frames,
+            "ObservedFrames": len(visit),
             "DwellTimeSeconds": dwell_time
         })
 
@@ -439,14 +452,48 @@ dwell_df.to_csv(
     index=False
 )
 
-print("Dwell-time calculation completed.")
+tracking_df.to_csv(
+    os.path.join(OUTPUT_DIR, "target_tracking.csv"),
+    index=False
+)
+
+print("Movement and dwell-time calculations completed.")
 
 
 # ============================================================
-# 7. INTERACTIVE FRAME-BY-FRAME VISUALIZATION
+# 8. FIXED 3D AXIS CONFIGURATION
 # ============================================================
 
-from matplotlib.widgets import Button
+def set_fixed_axes(ax):
+
+    ax.set_xlim(X_LIMITS)
+    ax.set_ylim(Y_LIMITS)
+    ax.set_zlim(Z_LIMITS)
+
+    ax.set_xlabel("X (m)")
+    ax.set_ylabel("Y (m)")
+    ax.set_zlabel("Z (m)")
+
+    # Keep the same physical scale on all axes
+    ax.set_box_aspect((
+        X_LIMITS[1] - X_LIMITS[0],
+        Y_LIMITS[1] - Y_LIMITS[0],
+        Z_LIMITS[1] - Z_LIMITS[0]
+    ))
+
+    # Show the origin in the same position
+    ax.scatter(
+        0, 0, 0,
+        color="black",
+        marker="+",
+        s=80,
+        label="Origin"
+    )
+
+
+# ============================================================
+# 9. INTERACTIVE FRAME-BY-FRAME VIEWER
+# ============================================================
 
 print("\nOpening frame viewer...")
 
@@ -469,7 +516,6 @@ def plot_frame(index):
         clustered_df["FrameIndex"] == frame
     ]
 
-    # Plot DBSCAN clusters
     for cluster_id in sorted(
         frame_points["ClusterID"].unique()
     ):
@@ -499,7 +545,6 @@ def plot_frame(index):
                 label=f"Cluster {cluster_id}"
             )
 
-    # Plot target centroids
     target_points = tracking_df[
         tracking_df["FrameIndex"] == frame
     ]
@@ -522,11 +567,9 @@ def plot_frame(index):
             f" T{int(target['TargetID'])}"
         )
 
-    ax.set_title(f"Radar Point Cloud - Frame {frame}")
+    set_fixed_axes(ax)
 
-    ax.set_xlabel("X (m)")
-    ax.set_ylabel("Y (m)")
-    ax.set_zlabel("Z (m)")
+    ax.set_title(f"Radar Point Cloud - Frame {frame}")
 
     ax.legend(loc="upper right")
 
@@ -557,7 +600,6 @@ def previous_frame(event):
     plot_frame(current_index)
 
 
-# Navigation buttons
 ax_previous = plt.axes([0.35, 0.05, 0.12, 0.06])
 ax_next = plt.axes([0.53, 0.05, 0.12, 0.06])
 
@@ -573,10 +615,10 @@ plt.show()
 
 
 # ============================================================
-# 9. SEPARATE 3D TRAJECTORY PLOT FOR EACH TARGET
+# 10. SEPARATE TRAJECTORY PLOT FOR EACH TARGET
 # ============================================================
 
-print("\nGenerating individual target trajectory plots...")
+print("\nDisplaying individual target trajectories...")
 
 target_ids = sorted(
     tracking_df["TargetID"].unique()
@@ -589,7 +631,12 @@ for target_id in target_ids:
     ].sort_values("FrameIndex")
 
     if len(target_data) < 2:
-        print(f"Skipping Target {target_id}: insufficient points.")
+
+        print(
+            f"Skipping Target {target_id}: "
+            "insufficient trajectory points."
+        )
+
         continue
 
     x = target_data["X"].to_numpy()
@@ -599,7 +646,6 @@ for target_id in target_ids:
     fig = plt.figure(figsize=(9, 7))
     ax = fig.add_subplot(111, projection="3d")
 
-    # Trajectory
     ax.plot(
         x, y, z,
         marker="o",
@@ -608,7 +654,6 @@ for target_id in target_ids:
         label="Trajectory"
     )
 
-    # Starting position
     ax.scatter(
         x[0], y[0], z[0],
         color="green",
@@ -616,7 +661,6 @@ for target_id in target_ids:
         label="Start"
     )
 
-    # Ending position
     ax.scatter(
         x[-1], y[-1], z[-1],
         color="red",
@@ -624,7 +668,6 @@ for target_id in target_ids:
         label="End"
     )
 
-    # Direction arrows
     for i in range(len(x) - 1):
 
         dx = x[i + 1] - x[i]
@@ -639,34 +682,28 @@ for target_id in target_ids:
             linewidth=1.5
         )
 
+    set_fixed_axes(ax)
+
     ax.set_title(f"3D Trajectory - Target {target_id}")
-
-    ax.set_xlabel("New X (m)")
-    ax.set_ylabel("New Y (m)")
-    ax.set_zlabel("New Z (m)")
-
     ax.legend()
-    plt.tight_layout()
 
-    # Display only; do not save
+    plt.tight_layout()
     plt.show()
     plt.close()
 
 
 # ============================================================
-# 9. FINAL SUMMARY
+# 11. FINAL SUMMARY
 # ============================================================
 
-print("\n===================================")
+print("\n====================================")
 print("RADAR PROCESSING COMPLETED")
-print("===================================")
+print("====================================")
 
 print("Frames processed:", len(frames))
 print("Valid radar points:", len(df))
 print("Clusters detected:", len(centroids_df))
 print("Targets identified:", tracking_df["TargetID"].nunique())
-
-print("\nTarget IDs:")
 
 for target_id in target_ids:
 
@@ -679,4 +716,5 @@ for target_id in target_ids:
         f"{len(target_data)} observations"
     )
 
-print("\nOutput files are saved in:", OUTPUT_DIR)
+print("\nCSV outputs saved in:", OUTPUT_DIR)
+print("No plot images were saved.")

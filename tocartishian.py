@@ -2,7 +2,7 @@
 import csv
 import math
 
-INPUT_FILE = "y-move\k_point_cloud.csv"
+INPUT_FILE = "z-move\\zk2026-11-11-23-46-44_point_cloud.csv"
 OUTPUT_FILE = "radar_xyz.csv"
 
 with open(INPUT_FILE, "r", newline="", encoding="utf-8-sig") as infile:
